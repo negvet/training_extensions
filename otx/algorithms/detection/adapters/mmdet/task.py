@@ -593,7 +593,7 @@ class MMDetectionTask(OTXDetectionTask):
             workers_per_gpu=cfg.data.get("workers_per_gpu", 0),
             num_gpus=len(cfg.gpu_ids),
             dist=cfg.distributed,
-            seed=cfg.get("seed", None),
+            seed=0, # cfg.get("seed", None),
             shuffle=False,
         )
 
@@ -643,37 +643,207 @@ class MMDetectionTask(OTXDetectionTask):
 
 
 
-
-
-
         import math
         import cv2
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
 
-        image_id = 9
+        # Benchmark
+        from scipy.ndimage import gaussian_filter
+        from typing import Tuple
+        import torch.nn.functional as F
+
+        # Visualize
+        import mmcv
+        from mmcv.image import tensor2imgs
+
+        image_id = 1
         target_class_id = 0
-        target_box_id = 1
+        target_box_id = 0
 
         DET_CONF_THRESH = 0.5
-        LIMITER = 1
+        LIMITER = 70
+
+        image_ids = list(range(LIMITER))
+        # image_ids = list(range(7, LIMITER))
+        # image_ids = [image_id]  # Manual image selection
 
         PERTURB_MODE = 'delete'
         # PERTURB_MODE = 'preserve'
-        ZERO_OUT_VAL = -20
+        HEAD_INFER_BUDGET = 300
+        ZERO_OUT_VAL = -0
         CELL_PADDING = 1
         NUM_PERT_CELLS = 1
 
+        run_deletion_insertion = 0
+        NUM_STEPS_INS_DEL = 700
+
+        use_drise = 0
+        n_masks_rise = 500
+        rise_seed = 0
+
+        use_fm_drise = 0
+
+        print('use_drise', use_drise)
         print('PERTURB_MODE', PERTURB_MODE)
         print('ZERO_OUT_VAL', ZERO_OUT_VAL)
         print('CELL_PADDING', CELL_PADDING)
         print('NUM_PERT_CELLS', NUM_PERT_CELLS)
         print('LIMITER', LIMITER)
+        print('NUM_STEPS_INS_DEL', NUM_STEPS_INS_DEL)
+        print('HEAD_INFER_BUDGET', HEAD_INFER_BUDGET)
         print()
 
-        use_drise = 0
-        n_masks_rise = 3000
-        rise_seed = 0
+        def gkern(klen, nsig):
+            """Returns a Gaussian kernel array.
+            Convolution with it results in image blurring."""
+            # create nxn zeros
+            inp = np.zeros((klen, klen))
+            # set element at the middle to one, a dirac delta
+            inp[klen // 2, klen // 2] = 1
+            # gaussian-smooth the dirac, resulting in a gaussian filter mask
+            k = gaussian_filter(inp, nsig)
+            kern = np.zeros((3, 3, klen, klen))
+            kern[0, 0] = k
+            kern[1, 1] = k
+            kern[2, 2] = k
+            return torch.from_numpy(kern.astype('float32'))
+
+        def auc(arr):
+            """Returns normalized Area Under Curve of the array."""
+            return (arr.sum() - arr[0] / 2 - arr[-1] / 2) / (arr.shape[0] - 1)
+
+        class CausalMetric():
+            def __init__(self, model, mode, step, substrate_fn, inherit_hw_from_input=False):
+                r"""Create deletion/insertion metric instance.
+
+                Args:
+                    model (nn.Module): Black-box model being explained.
+                    mode (str): 'del' or 'ins'.
+                    step (int): number of pixels modified per one iteration.
+                    substrate_fn (func): a mapping from old pixels to new pixels.
+                """
+                assert mode in ['del', 'ins']
+                self.model = model
+                self.mode = mode
+                self.step = step
+                self.substrate_fn = substrate_fn
+                self.inherit_hw_from_input = inherit_hw_from_input
+
+                self.batch_size = 16
+
+            def single_run(self, data, explanation, verbose=0, save_to=None, target_class=None,
+                           target_box=None, n_steps=None):
+                r"""Run metric on one image-saliency pair.
+
+                Args:
+                    img_tensor (Tensor): normalized image tensor.
+                    explanation (np.ndarray): saliency map.
+                    verbose (int): in [0, 1, 2].
+                        0 - return list of scores.
+                        1 - also plot final step.
+                        2 - also plot every step and print 2 top classes.
+                    save_to (str): directory to save every step plots to.
+
+                Return:
+                    scores (nd.array): Array containing scores at every step.
+                """
+
+                data_copy = deepcopy(data)
+                img_tensor = data_copy['img'][0].data[0]
+
+                global HW
+                if self.inherit_hw_from_input:
+                    HW = np.prod(img_tensor.shape[2:4])
+                    H = img_tensor.size(2)
+                    W = img_tensor.size(3)
+                else:
+                    H = W = 416
+
+                if n_steps is None:
+                    n_steps = (HW + self.step - 1) // self.step
+
+                if self.mode == 'del':
+                    # title = 'Deletion game'
+                    # ylabel = 'Pixels deleted'
+                    start = img_tensor.clone()
+                    finish = self.substrate_fn(img_tensor)
+                elif self.mode == 'ins':
+                    # title = 'Insertion game'
+                    # ylabel = 'Pixels inserted'
+                    start = self.substrate_fn(img_tensor)
+                    finish = img_tensor.clone()
+
+                scores = np.empty(n_steps + 1)
+                # Coordinates of pixels in order of decreasing saliency
+                salient_order = np.flip(np.argsort(explanation.reshape(-1, HW), axis=1), axis=-1)
+
+                num_chunks = ((n_steps + 1) + self.batch_size - 1) // self.batch_size
+                i = 0
+                for chunk in range(num_chunks):
+                    n_imgs_in_chank = min((n_steps + 1) - self.batch_size * chunk, self.batch_size)
+                    img_batch = []
+                    i_start = i
+                    for _ in range(n_imgs_in_chank):
+                        img_batch.append(start.clone().cpu())
+                        coords = salient_order[:, self.step * i:self.step * (i + 1)]
+                        start_flatten = start.cpu().numpy().reshape(1, 3, HW)
+                        start_flatten[0, :, coords] = finish.cpu().numpy().reshape(1, 3, HW)[0, :, coords]
+                        start = torch.tensor(start_flatten.reshape(1, 3, H, W))
+                        i += 1
+
+                    img_batch = torch.cat(img_batch)
+
+                    data_copy['img'][0].data[0] = img_batch.cuda()
+                    data_copy['img_metas'][0]._data[0] = deepcopy(
+                        data['img_metas'][0].data[0] * n_imgs_in_chank)
+                    # print('len img metas', len(data_copy['img_metas'][0]))
+                    # out = inference_detector(self.model, data_copy)
+                    out = model(return_loss=False, rescale=True, **data_copy)
+                    # print('out', out[0].shape)
+
+                    s = []
+                    for batch_iddx in range(len(out)):
+                        pred = out[batch_iddx][0][target_class]
+                        sc = max([iou(target_box, box) * score for *box, score in pred],
+                                 default=0)
+                        s.append(sc)
+
+                    scores[i_start:i] = s
+
+                    # predictions = self.model(img_batch.cuda())
+                    # predictions = torch.sigmoid(predictions)
+                    # scores[i_start:i] = predictions[:, c, 0, 0].detach().cpu().numpy()
+
+                return scores
+
+        def deletion_insertion_single_run(data, saliency: np.array, target_class: int,
+                                          target_box,
+                                          inherit_hw_from_input: bool = False) -> Tuple[float, float]:
+            klen = 11
+            ksig = 5
+            kern = gkern(klen, ksig)
+
+            # Function that blurs input image
+            blur = lambda x: F.conv2d(x, kern, padding=klen // 2)
+
+            num_steps = NUM_STEPS_INS_DEL  # saliency_map.shape[0]  # 416 for 416*416, resulting in 416 iterations
+
+            insertion = CausalMetric(model, 'ins', num_steps, substrate_fn=blur,
+                                     inherit_hw_from_input=inherit_hw_from_input)
+            deletion = CausalMetric(model, 'del', num_steps, substrate_fn=torch.zeros_like,
+                                    inherit_hw_from_input=inherit_hw_from_input)
+
+            h_del = deletion.single_run(data, saliency, verbose=0,
+                                        target_class=target_class,
+                                        target_box=target_box)  # , save_to='/home/etsykuno/tmp/'
+            h_ins = insertion.single_run(data, saliency, verbose=0,
+                                         target_class=target_class,
+                                         target_box=target_box)  # , save_to='/home/etsykuno/tmp/'
+
+            h_del_auc = auc(h_del)
+            h_ins_auc = auc(h_ins)
+            return h_del_auc, h_ins_auc
 
         def iou(box1, box2):
             box1 = np.asarray(box1)
@@ -687,6 +857,20 @@ class MMDetectionTask(OTXDetectionTask):
 
         # D-RISE functions
         def generate_mask(image_size, grid_size, prob_thresh):
+            image_w, image_h = image_size
+            grid_w, grid_h = grid_size
+            cell_w, cell_h = math.ceil(image_w / grid_w), math.ceil(image_h / grid_h)
+            up_w, up_h = (grid_w + 1) * cell_w, (grid_h + 1) * cell_h
+            mask = (np.random.uniform(0, 1, size=(grid_h, grid_w)) <
+                    prob_thresh).astype(np.float32)
+            mask = cv2.resize(mask, (up_w, up_h), interpolation=cv2.INTER_LINEAR)
+            offset_w = np.random.randint(0, cell_w)
+            offset_h = np.random.randint(0, cell_h)
+            mask = mask[offset_h:offset_h + image_h, offset_w:offset_w + image_w]
+            return mask
+
+        # D-RISE functions
+        def generate_mask_fm_drize(image_size, grid_size, prob_thresh):
             image_w, image_h = image_size
             grid_w, grid_h = grid_size
             cell_w, cell_h = math.ceil(image_w / grid_w), math.ceil(image_h / grid_h)
@@ -794,13 +978,14 @@ class MMDetectionTask(OTXDetectionTask):
             # print('score', score)
             return score
 
+        del_auc_hist = []
+        ins_auc_hist = []
+
+        time_hist = []
+
         with torch.no_grad():
-            image_ids = list(range(LIMITER))
             for image_iddx, image_id in enumerate(image_ids):
                 print(f'\nRun {image_iddx + 1}/{len(image_ids)}')
-
-                # Manual image selection
-                image_id = 1
 
                 for i, data in enumerate(dataloader):
                     if i == image_id:
@@ -826,12 +1011,14 @@ class MMDetectionTask(OTXDetectionTask):
                                 # Pick only the first (most confident) prediction per-class
                                 break
 
-                # Manual target selection
-                target_classes = [target_class_id]
-                detection_ids = [[target_box_id]]
+                # # Manual target selection
+                # target_classes = [target_class_id]
+                # detection_ids = [[target_box_id]]
 
                 for iddx, target_class_id in enumerate(target_classes):
                     for target_box_id in detection_ids[iddx]:
+                        tic = time.time()
+
                         *target_box, target_score = result[0][0][target_class_id][target_box_id, :]
 
                         imgs = data['img'][0].data[0].cuda()
@@ -845,7 +1032,7 @@ class MMDetectionTask(OTXDetectionTask):
 
                         print()
                         print(
-                            f'Start explain, class {dataloader.dataset.CLASSES[target_class_id]}, box_id {target_box_id}')
+                            f'Start explain image {image_id}, class {dataloader.dataset.CLASSES[target_class_id]}, box_id {target_box_id}')
 
                         if use_drise:
                             # D-RISE
@@ -874,13 +1061,17 @@ class MMDetectionTask(OTXDetectionTask):
                                 pred = out_perturbed[0][0][target_class_id]
                                 for *box, score in pred:
                                     if box == target_box and score == target_score:
-                                        # print('target bbox available')
+                                        # print('target bbox available - zeroed out FPN level is not used for prediction')
                                         num_usefull_fpn_levels -= 1
                                         used_fpn_levels.remove(i)
                                         break
                                 # print()
                             print('used_fpn_level idxs', used_fpn_levels)
 
+
+
+
+                            # # Initial implementation (propagate perturbations from the top FPN level)
                             # ref_fpn_level = -1
                             # _, _, h, w = backbone_out[ref_fpn_level].size()
                             # h = h // NUM_PERT_CELLS
@@ -904,113 +1095,573 @@ class MMDetectionTask(OTXDetectionTask):
                             #     # break
                             # saliency_map = sm / sm.max()
 
+
+
+
+
+
+
+                            # Apply D-RISE in feature map space, taking into account used FPN levels and bbox location
+                            print('Apply D-RISE in feature map space, taking into account used FPN levels and bbox location')
+                            print('n_masks_rise', n_masks_rise)
                             target_box_unit = [target_box[0] / ori_w,
                                                target_box[1] / ori_h,
                                                target_box[2] / ori_w,
                                                target_box[3] / ori_h]
-                            box_unit_width = target_box_unit[2] - target_box_unit[0]
-                            box_unit_height = target_box_unit[3] - target_box_unit[1]
-                            PAD_COEF = 0.25
-                            target_roi_unit = [
-                                max(target_box_unit[0] - box_unit_width * PAD_COEF, 0.0),
-                                max(target_box_unit[1] - box_unit_height * PAD_COEF, 0.0),
-                                min(target_box_unit[2] + box_unit_width * PAD_COEF, 1.0),
-                                min(target_box_unit[3] + box_unit_height * PAD_COEF, 1.0),
+                            _, _, fpn_used_h, fpn_used_w = backbone_out[used_fpn_levels[-1]].size()
+
+                            target_box_used_fpn = [target_box_unit[0] * fpn_used_w,
+                                                   target_box_unit[1] * fpn_used_h,
+                                                   target_box_unit[2] * fpn_used_w,
+                                                   target_box_unit[3] * fpn_used_h]
+
+                            box_width = target_box_used_fpn[2] - target_box_used_fpn[0]
+                            box_height = target_box_used_fpn[3] - target_box_used_fpn[1]
+
+                            PAD_COEF = 0.5
+                            target_roi = [
+                                math.floor(max(target_box_used_fpn[0] - box_width * PAD_COEF, 0)),
+                                math.floor(max(target_box_used_fpn[1] - box_height * PAD_COEF, 0)),
+                                math.ceil(min(target_box_used_fpn[2] + box_width * PAD_COEF, fpn_used_w)),
+                                math.ceil(min(target_box_used_fpn[3] + box_height * PAD_COEF, fpn_used_h)),
                             ]
-                            target_roi_unit_width = target_roi_unit[2] - target_roi_unit[0]
-                            target_roi_unit_height = target_roi_unit[3] - target_roi_unit[1]
-                            HEAD_INFER_BUDGET = 100
+                            target_roi_width = target_roi[2] - target_roi[0]
+                            target_roi_height = target_roi[3] - target_roi[1]
 
-                            highest_fpn_used = backbone_out[used_fpn_levels[-1]]
-                            _, _, h_highest_fpn_used, w_highest_fpn_used = highest_fpn_used.size()
-                            _, _, h__, w__ = highest_fpn_used.size()
-                            h_from = math.floor(target_roi_unit[1] * h__)
-                            h_to = math.ceil(target_roi_unit[3] * h__)
-                            w_from = math.floor(target_roi_unit[0] * w__)
-                            w_to = math.ceil(target_roi_unit[2] * w__)
-                            _, _, h__, w__ = highest_fpn_used[:, :, h_from:h_to, w_from:w_to].size()
+                            grid_size = 7
+                            grid_h = int(math.sqrt(grid_size * grid_size / (target_roi_width / target_roi_height)))
+                            grid_w = grid_size * grid_size // grid_h
+                            image_w = target_roi_width
+                            image_h = target_roi_height
 
-                            kernel_width = 1
-                            h = h_to - h_from
-                            w = w_to - w_from
-                            while h * w > HEAD_INFER_BUDGET:
-                                kernel_width += 1
-                                h /= kernel_width
-                                w /= kernel_width
-                            print('kernel_width', kernel_width)
+                            cell_w, cell_h = math.ceil(image_w / grid_w), math.ceil(image_h / grid_h)
+                            up_w, up_h = (grid_w + 1) * cell_w, (grid_h + 1) * cell_h
 
-                            print('h_to - h_from', h_to - h_from)
-                            print('w_to - w_from', w_to - w_from)
+                            def generate_mask_fm():
+                                mask = (np.random.uniform(0, 1, size=(grid_h, grid_w)) <
+                                        0.5).astype(np.float32)
+                                mask = cv2.resize(mask, (up_w, up_h), interpolation=cv2.INTER_LINEAR)
+                                offset_w = np.random.randint(0, cell_w)
+                                offset_h = np.random.randint(0, cell_h)
+                                mask_box = mask[offset_h:offset_h + image_h, offset_w:offset_w + image_w]
 
-                            h = math.ceil((h_to - h_from) / kernel_width)
-                            w = math.ceil((w_to - w_from) / kernel_width)
-                            print('h * w', h * w, 'h, w', h, w)
+                                mask = np.zeros((fpn_used_h, fpn_used_w))
+                                h_mask_from = target_roi[1]
+                                h_mask_to = h_mask_from + mask_box.shape[0]
+                                w_mask_from = target_roi[0]
+                                w_mask_to = w_mask_from + mask_box.shape[1]
+                                mask[h_mask_from: h_mask_to, w_mask_from:w_mask_to] = mask_box
 
-                            sm = np.zeros((highest_fpn_used.shape[2], highest_fpn_used.shape[3]))
-                            for h_idx in range(h_from, h_from + h * kernel_width, kernel_width):
-                                for w_idx in range(w_from, w_from + w * kernel_width, kernel_width):
+                                mask_fm = []
+                                for t in backbone_out:
+                                    _, _, fm_h, fm_w = t.size()
+                                    mask_fm.append(
+                                        cv2.resize(mask, (fm_w, fm_h), interpolation=cv2.INTER_LINEAR).astype(
+                                            np.float32))
 
-                                    h_from_unit = h_idx / h_highest_fpn_used
-                                    h_to_unit = (h_idx + kernel_width) / h_highest_fpn_used
-                                    w_from_unit = w_idx / w_highest_fpn_used
-                                    w_to_unit = (w_idx + kernel_width) / w_highest_fpn_used
+                                return mask_fm, mask_box, (h_mask_from, h_mask_to, w_mask_from, w_mask_to)
 
-                                    backbone_out_clone = [torch.clone(t) for t in backbone_out]
-                                    backbone_out_clone[used_fpn_levels[-1]][:, :, h_idx:h_idx + kernel_width,
-                                    w_idx:w_idx + kernel_width] = ZERO_OUT_VAL
-                                    for fpn_level_idx in used_fpn_levels[:-1]:
-                                        _, _, h_, w_ = backbone_out_clone[fpn_level_idx].size()
-                                        backbone_out_clone[fpn_level_idx][:, :,
-                                        math.floor(h_from_unit * h_):math.ceil(h_to_unit * h_),
-                                        math.floor(w_from_unit * w_):math.ceil(w_to_unit * w_)] = ZERO_OUT_VAL
-                                    # backbone_out_clone_np = [np.abs(item[0][0].detach().cpu().numpy()) / 100 for
-                                    #                              item in
-                                    #                              backbone_out_clone]
+                            mask_box_aggr = None
+                            for _ in range(n_masks_rise):
+                                mask_fm, mask_box, slices = generate_mask_fm()
 
-                                    proposals_perturbed = model.module.rpn_head.simple_test_rpn(backbone_out_clone,
-                                                                                                img_metas)
-                                    out_perturbed = model.module.roi_head.simple_test(backbone_out_clone,
-                                                                                      proposals_perturbed,
-                                                                                      img_metas, rescale=True)
-                                    pred = out_perturbed[0][0][target_class_id]
-                                    score = target_score - max([iou(target_box, box) * score for *box, score in pred],
-                                                               default=0)
-                                    sm[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = score
-                                    # sm[h_idx:h_idx+kernel_width, w_idx:w_idx+kernel_width] = 1
-                                #     break
-                                # break
+                                backbone_out_clone = [torch.clone(t) for t in backbone_out]
+                                backbone_out_clone = [backbone_out_clone[i] * torch.tensor(mask_fm[i]).cuda() for i in
+                                                      range(len(backbone_out_clone))]
+                                proposals_perturbed = model.module.rpn_head.simple_test_rpn(backbone_out_clone,
+                                                                                            img_metas)
+                                out_perturbed = model.module.roi_head.simple_test(backbone_out_clone,
+                                                                                  proposals_perturbed,
+                                                                                  img_metas, rescale=True)
+                                pred = out_perturbed[0][0][target_class_id]
+                                score = max([iou(target_box, box) * score for *box, score in pred], default=0)
 
-                            saliency_map = sm / sm.max()
+                                if mask_box_aggr is None:
+                                    mask_box_aggr = mask_box * score
+                                else:
+                                    mask_box_aggr += mask_box * score
 
-                            # num_roi_pixels_lower_fpn_level = f(target_roi_unit, backbone_out, used_fpn_levels[-1].size())
+                            mask_box_aggr = mask_box_aggr - mask_box_aggr.min()
+                            mask_box_aggr /= mask_box_aggr.max()
+
+                            h_mask_from, h_mask_to, w_mask_from, w_mask_to = slices
+                            saliency_map = np.zeros((fpn_used_h, fpn_used_w), dtype=np.float32)
+                            saliency_map[h_mask_from: h_mask_to, w_mask_from:w_mask_to] = mask_box_aggr
+
+
+
+
+
+                            # # # Propagate perturbations from the highest used FPN level (remaster with resizing masks)
+                            # print('Propagate perturbations from the highest used FPN level (remaster with resizing masks)')
+                            # target_box_unit = [target_box[0] / ori_w,
+                            #                    target_box[1] / ori_h,
+                            #                    target_box[2] / ori_w,
+                            #                    target_box[3] / ori_h]
+                            # _, _, fpn_used_h, fpn_used_w = backbone_out[used_fpn_levels[-1]].size()
+                            #
+                            # target_box_used_fpn = [target_box_unit[0] * fpn_used_w,
+                            #                        target_box_unit[1] * fpn_used_h,
+                            #                        target_box_unit[2] * fpn_used_w,
+                            #                        target_box_unit[3] * fpn_used_h]
+                            #
+                            # box_width = target_box_used_fpn[2] - target_box_used_fpn[0]
+                            # box_height = target_box_used_fpn[3] - target_box_used_fpn[1]
+                            #
+                            # PAD_COEF = 0.25
+                            # target_roi = [
+                            #     math.floor(max(target_box_used_fpn[0] - box_width * PAD_COEF, 0)),
+                            #     math.floor(max(target_box_used_fpn[1] - box_height * PAD_COEF, 0)),
+                            #     math.ceil(min(target_box_used_fpn[2] + box_width * PAD_COEF, fpn_used_w)),
+                            #     math.ceil(min(target_box_used_fpn[3] + box_height * PAD_COEF, fpn_used_h)),
+                            # ]
+                            # h_from = target_roi[1]
+                            # h_to = target_roi[3]
+                            # w_from = target_roi[0]
+                            # w_to = target_roi[2]
+                            #
+                            # target_roi_width = w_to - w_from
+                            # target_roi_height = h_to - h_from
+                            #
+                            # # Solve for highest_fpn_used
+                            # kernel_width = 1
+                            # h = target_roi_height
+                            # w = target_roi_width
+                            # print('h', h)
+                            # print('w', w)
+                            #
+                            # while h * w > HEAD_INFER_BUDGET:
+                            #     kernel_width += 1
+                            #     h /= kernel_width
+                            #     w /= kernel_width
+                            # print('final kernel_width', kernel_width)
+                            #
+                            # h = math.ceil(target_roi_height / kernel_width)
+                            # w = math.ceil(target_roi_width / kernel_width)
+                            # print('final h * w', h * w, 'h, w', h, w)
+                            # print('target_roi[1], target_roi[1] + h * kernel_width', target_roi[1],
+                            #       target_roi[1] + h * kernel_width)
+                            # print('target_roi[0], target_roi[0] + w * kernel_width', target_roi[0],
+                            #       target_roi[0] + w * kernel_width)
+                            #
+                            # def generate_mask_fm(h_idx, w_idx):
+                            #     mask = np.zeros((fpn_used_h, fpn_used_w)) + 1.0
+                            #     mask[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = ZERO_OUT_VAL
+                            #     mask_fm = []
+                            #     for t in backbone_out:
+                            #         _, _, fm_h, fm_w = t.size()
+                            #         mask_fm.append(
+                            #             cv2.resize(mask, (fm_w, fm_h), interpolation=cv2.INTER_LINEAR).astype(
+                            #                 np.float32))
+                            #     return mask_fm
+                            #
+                            # sm = np.zeros((fpn_used_h, fpn_used_w))
+                            # for h_idx in range(h_from, h_from + h * kernel_width, kernel_width):
+                            #     for w_idx in range(w_from, w_from + w * kernel_width, kernel_width):
+                            #         mask_fm = generate_mask_fm(h_idx, w_idx)
+                            #
+                            #         backbone_out_clone = [torch.clone(t) for t in backbone_out]
+                            #         backbone_out_clone = [backbone_out_clone[i] * torch.tensor(mask_fm[i]).cuda() for i
+                            #                               in
+                            #                               range(len(backbone_out_clone))]
+                            #         proposals_perturbed = model.module.rpn_head.simple_test_rpn(backbone_out_clone,
+                            #                                                                     img_metas)
+                            #         out_perturbed = model.module.roi_head.simple_test(backbone_out_clone,
+                            #                                                           proposals_perturbed,
+                            #                                                           img_metas, rescale=True)
+                            #         pred = out_perturbed[0][0][target_class_id]
+                            #         score = target_score - max([iou(target_box, box) * score for *box, score in pred],
+                            #                                    default=0)
+                            #
+                            #         sm[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = score
+                            #         # sm[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = 1
+                            #     #     break
+                            #     # break
+                            #
+                            # saliency_map = sm / sm.max()
+                            #
+                            # ### Do the same but with bigger kernel ###
+                            # kernel_width += 1  ###
+                            # h = math.ceil(target_roi_height / kernel_width)
+                            # w = math.ceil(target_roi_width / kernel_width)
+                            # print('final h * w', h * w, 'h, w', h, w)
+                            # print('target_roi[1], target_roi[1] + h * kernel_width', target_roi[1],
+                            #       target_roi[1] + h * kernel_width)
+                            # print('target_roi[0], target_roi[0] + w * kernel_width', target_roi[0],
+                            #       target_roi[0] + w * kernel_width)
+                            #
+                            # def generate_mask_fm(h_idx, w_idx):
+                            #     mask = np.zeros((fpn_used_h, fpn_used_w)) + 1.0
+                            #     mask[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = ZERO_OUT_VAL
+                            #     mask_fm = []
+                            #     for t in backbone_out:
+                            #         _, _, fm_h, fm_w = t.size()
+                            #         mask_fm.append(
+                            #             cv2.resize(mask, (fm_w, fm_h), interpolation=cv2.INTER_LINEAR).astype(
+                            #                 np.float32))
+                            #     return mask_fm
+                            #
+                            # sm = np.zeros((fpn_used_h, fpn_used_w))
+                            # for h_idx in range(h_from, h_from + h * kernel_width, kernel_width):
+                            #     for w_idx in range(w_from, w_from + w * kernel_width, kernel_width):
+                            #         mask_fm = generate_mask_fm(h_idx, w_idx)
+                            #
+                            #         backbone_out_clone = [torch.clone(t) for t in backbone_out]
+                            #         backbone_out_clone = [backbone_out_clone[i] * torch.tensor(mask_fm[i]).cuda() for i
+                            #                               in
+                            #                               range(len(backbone_out_clone))]
+                            #         proposals_perturbed = model.module.rpn_head.simple_test_rpn(backbone_out_clone,
+                            #                                                                     img_metas)
+                            #         out_perturbed = model.module.roi_head.simple_test(backbone_out_clone,
+                            #                                                           proposals_perturbed,
+                            #                                                           img_metas, rescale=True)
+                            #         pred = out_perturbed[0][0][target_class_id]
+                            #         score = target_score - max([iou(target_box, box) * score for *box, score in pred],
+                            #                                    default=0)
+                            #
+                            #         sm[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = score
+                            #         # sm[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = 1
+                            #     #     break
+                            #     # break
+                            #
+                            # saliency_map2 = sm / sm.max()
+                            #
+                            # saliency_map = saliency_map + saliency_map2
+                            # saliency_map /= saliency_map.max()
+
+
+
+
+
+
+
+                            # # Propagate perturbations from the highest used FPN level
+                            # # TODO: create a mask for the ori image and then just rescale it to required feature maps
+                            #
+                            # target_box_unit = [target_box[0] / ori_w,
+                            #                    target_box[1] / ori_h,
+                            #                    target_box[2] / ori_w,
+                            #                    target_box[3] / ori_h]
+                            # box_unit_width = target_box_unit[2] - target_box_unit[0]
+                            # box_unit_height = target_box_unit[3] - target_box_unit[1]
+                            # PAD_COEF = 0.25
+                            # target_roi_unit = [
+                            #     max(target_box_unit[0] - box_unit_width * PAD_COEF, 0.0),
+                            #     max(target_box_unit[1] - box_unit_height * PAD_COEF, 0.0),
+                            #     min(target_box_unit[2] + box_unit_width * PAD_COEF, 1.0),
+                            #     min(target_box_unit[3] + box_unit_height * PAD_COEF, 1.0),
+                            # ]
+                            # target_roi_unit_width = target_roi_unit[2] - target_roi_unit[0]
+                            # target_roi_unit_height = target_roi_unit[3] - target_roi_unit[1]
+                            #
+                            # highest_fpn_used = backbone_out[used_fpn_levels[-1]]
+                            # _, _, h_highest_fpn_used, w_highest_fpn_used = highest_fpn_used.size()
+                            # h_from = math.floor(target_roi_unit[1] * h_highest_fpn_used)  # highest_fpn_used
+                            # h_to = math.ceil(target_roi_unit[3] * h_highest_fpn_used)  # highest_fpn_used
+                            # w_from = math.floor(target_roi_unit[0] * w_highest_fpn_used)  # highest_fpn_used
+                            # w_to = math.ceil(target_roi_unit[2] * w_highest_fpn_used)  # highest_fpn_used
+                            #
+                            # # Solve for highest_fpn_used
+                            # kernel_width = 1
+                            # h = h_to - h_from
+                            # w = w_to - w_from
+                            # print('h_to - h_from', h_to - h_from)
+                            # print('w_to - w_from', w_to - w_from)
+                            #
+                            # while h * w > HEAD_INFER_BUDGET:
+                            #     kernel_width += 1
+                            #     h /= kernel_width
+                            #     w /= kernel_width
+                            # print('final kernel_width', kernel_width)
+                            #
+                            # h = math.ceil((h_to - h_from) / kernel_width)
+                            # w = math.ceil((w_to - w_from) / kernel_width)
+                            # print('final h * w', h * w, 'h, w', h, w)
+                            # print('h_from, h_from + h * kernel_width', h_from, h_from + h * kernel_width)
+                            # print('w_from, w_from + w * kernel_width', w_from, w_from + w * kernel_width)
+                            #
+                            # # ZERO_OUT_VAL = 0
+                            # # for t in backbone_out:
+                            # #     if t.min() < ZERO_OUT_VAL:
+                            # #         ZERO_OUT_VAL = t.min()
+                            # # # ZERO_OUT_VAL *= 2
+                            #
+                            # sm = np.zeros((highest_fpn_used.shape[2], highest_fpn_used.shape[3]))
+                            # for h_idx in range(h_from, h_from + h * kernel_width, kernel_width):
+                            #     for w_idx in range(w_from, w_from + w * kernel_width, kernel_width):
+                            #         backbone_out_clone = [torch.clone(t) for t in backbone_out]
+                            #
+                            #         # Handle lowest FPN level
+                            #         if PERTURB_MODE == 'delete':
+                            #             backbone_out_clone[used_fpn_levels[-1]][:, :, h_idx:h_idx + kernel_width,
+                            #             w_idx:w_idx + kernel_width] = ZERO_OUT_VAL
+                            #         elif PERTURB_MODE == 'preserve':
+                            #             t = backbone_out_clone[used_fpn_levels[-1]]
+                            #             tmp = torch.clone(
+                            #                 t[:, :, h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width])
+                            #             t[:, :, :, :] = ZERO_OUT_VAL
+                            #             t[:, :, h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = tmp
+                            #             backbone_out_clone[used_fpn_levels[-1]] = t
+                            #         else:
+                            #             raise NotImplementedError
+                            #
+                            #         # Handle the rest FPN levels
+                            #         # TODO: zero out all FPN levels that are more high
+                            #         h_from_unit = h_idx / h_highest_fpn_used
+                            #         h_to_unit = (h_idx + kernel_width) / h_highest_fpn_used
+                            #         w_from_unit = w_idx / w_highest_fpn_used
+                            #         w_to_unit = (w_idx + kernel_width) / w_highest_fpn_used
+                            #         for fpn_level_idx in range(used_fpn_levels[-1]):
+                            #         # for fpn_level_idx in used_fpn_levels[:-1]:
+                            #             _, _, h_, w_ = backbone_out_clone[fpn_level_idx].size()
+                            #             h_from_current_fpn = math.floor(h_from_unit * h_)
+                            #             h_to_current_fpn = math.ceil(h_to_unit * h_)
+                            #             w_from_current_fpn = math.floor(w_from_unit * w_)
+                            #             w_to_current_fpn = math.ceil(w_to_unit * w_)
+                            #             if PERTURB_MODE == 'delete':
+                            #                 backbone_out_clone[fpn_level_idx][:, :, h_from_current_fpn:h_to_current_fpn,
+                            #                 w_from_current_fpn:w_to_current_fpn] = ZERO_OUT_VAL
+                            #             elif PERTURB_MODE == 'preserve':
+                            #                 t = backbone_out_clone[fpn_level_idx]
+                            #                 tmp = torch.clone(t[:, :, h_from_current_fpn:h_to_current_fpn,
+                            #                                   w_from_current_fpn:w_to_current_fpn])
+                            #                 t[:, :, :, :] = ZERO_OUT_VAL
+                            #                 t[:, :, h_from_current_fpn:h_to_current_fpn,
+                            #                 w_from_current_fpn:w_to_current_fpn] = tmp
+                            #                 backbone_out_clone[fpn_level_idx] = t
+                            #             else:
+                            #                 raise NotImplementedError
+                            #
+                            #         # For preserve, zero out the rest FPN levels (to make it clean)
+                            #         if PERTURB_MODE == 'preserve':
+                            #             for jj in range(5):
+                            #                 if jj not in used_fpn_levels:
+                            #                     backbone_out_clone[jj][:, :, :, :] = ZERO_OUT_VAL
+                            #
+                            #         # backbone_out_clone_np = [(item[0][0].detach().cpu().numpy()) for
+                            #         #                          item in
+                            #         #                          backbone_out_clone]
+                            #
+                            #         proposals_perturbed = model.module.rpn_head.simple_test_rpn(backbone_out_clone,
+                            #                                                                     img_metas)
+                            #         out_perturbed = model.module.roi_head.simple_test(backbone_out_clone,
+                            #                                                           proposals_perturbed,
+                            #                                                           img_metas, rescale=True)
+                            #
+                            #         score = get_score(out_perturbed, target_class_id, target_box, target_score)
+                            #         # print('score', score)
+                            #
+                            #         sm[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = score
+                            #     #     sm[h_idx:h_idx+kernel_width, w_idx:w_idx+kernel_width] = 1  # sanity check
+                            #     #     break
+                            #     # break
+                            #
+                            # saliency_map = sm / sm.max()
+
+
+
+                            # ### Do the same but with bigger kernel
+                            # saliency_map1 = sm / sm.max()
+                            #
+                            # kernel_width += kernel_width
+                            # print('One more kernel_width', kernel_width)
+                            #
+                            # h = math.ceil((h_to - h_from) / kernel_width)
+                            # w = math.ceil((w_to - w_from) / kernel_width)
+                            # print('final h * w', h * w, 'h, w', h, w)
+                            # print('h_from, h_from + h * kernel_width', h_from, h_from + h * kernel_width)
+                            # print('w_from, w_from + w * kernel_width', w_from, w_from + w * kernel_width)
+                            #
+                            # # ZERO_OUT_VAL = 0
+                            # # for t in backbone_out:
+                            # #     if t.min() < ZERO_OUT_VAL:
+                            # #         ZERO_OUT_VAL = t.min()
+                            # # # ZERO_OUT_VAL *= 2
+                            #
+                            # sm2 = np.zeros((highest_fpn_used.shape[2], highest_fpn_used.shape[3]))
+                            # for h_idx in range(h_from, h_from + h * kernel_width, kernel_width):
+                            #     for w_idx in range(w_from, w_from + w * kernel_width, kernel_width):
+                            #         backbone_out_clone = [torch.clone(t) for t in backbone_out]
+                            #
+                            #         # Handle lowest FPN level
+                            #         if PERTURB_MODE == 'delete':
+                            #             backbone_out_clone[used_fpn_levels[-1]][:, :, h_idx:h_idx + kernel_width,
+                            #             w_idx:w_idx + kernel_width] = ZERO_OUT_VAL
+                            #         elif PERTURB_MODE == 'preserve':
+                            #             t = backbone_out_clone[used_fpn_levels[-1]]
+                            #             tmp = torch.clone(
+                            #                 t[:, :, h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width])
+                            #             t[:, :, :, :] = ZERO_OUT_VAL
+                            #             t[:, :, h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = tmp
+                            #             backbone_out_clone[used_fpn_levels[-1]] = t
+                            #         else:
+                            #             raise NotImplementedError
+                            #
+                            #         # Handle the rest FPN levels
+                            #         # TODO: zero out all FPN levels that are more high
+                            #         h_from_unit = h_idx / h_highest_fpn_used
+                            #         h_to_unit = (h_idx + kernel_width) / h_highest_fpn_used
+                            #         w_from_unit = w_idx / w_highest_fpn_used
+                            #         w_to_unit = (w_idx + kernel_width) / w_highest_fpn_used
+                            #         for fpn_level_idx in range(used_fpn_levels[-1]):
+                            #             # for fpn_level_idx in used_fpn_levels[:-1]:
+                            #             _, _, h_, w_ = backbone_out_clone[fpn_level_idx].size()
+                            #             h_from_current_fpn = math.floor(h_from_unit * h_)
+                            #             h_to_current_fpn = math.ceil(h_to_unit * h_)
+                            #             w_from_current_fpn = math.floor(w_from_unit * w_)
+                            #             w_to_current_fpn = math.ceil(w_to_unit * w_)
+                            #             if PERTURB_MODE == 'delete':
+                            #                 backbone_out_clone[fpn_level_idx][:, :, h_from_current_fpn:h_to_current_fpn,
+                            #                 w_from_current_fpn:w_to_current_fpn] = ZERO_OUT_VAL
+                            #             elif PERTURB_MODE == 'preserve':
+                            #                 t = backbone_out_clone[fpn_level_idx]
+                            #                 tmp = torch.clone(t[:, :, h_from_current_fpn:h_to_current_fpn,
+                            #                                   w_from_current_fpn:w_to_current_fpn])
+                            #                 t[:, :, :, :] = ZERO_OUT_VAL
+                            #                 t[:, :, h_from_current_fpn:h_to_current_fpn,
+                            #                 w_from_current_fpn:w_to_current_fpn] = tmp
+                            #                 backbone_out_clone[fpn_level_idx] = t
+                            #             else:
+                            #                 raise NotImplementedError
+                            #
+                            #         # For preserve, zero out the rest FPN levels (to make it clean)
+                            #         if PERTURB_MODE == 'preserve':
+                            #             for jj in range(5):
+                            #                 if jj not in used_fpn_levels:
+                            #                     backbone_out_clone[jj][:, :, :, :] = ZERO_OUT_VAL
+                            #
+                            #         # backbone_out_clone_np = [(item[0][0].detach().cpu().numpy()) for
+                            #         #                          item in
+                            #         #                          backbone_out_clone]
+                            #
+                            #         proposals_perturbed = model.module.rpn_head.simple_test_rpn(backbone_out_clone,
+                            #                                                                     img_metas)
+                            #         out_perturbed = model.module.roi_head.simple_test(backbone_out_clone,
+                            #                                                           proposals_perturbed,
+                            #                                                           img_metas, rescale=True)
+                            #
+                            #         score = get_score(out_perturbed, target_class_id, target_box, target_score)
+                            #         # print('score', score)
+                            #
+                            #         sm2[h_idx:h_idx + kernel_width, w_idx:w_idx + kernel_width] = score
+                            #     #     sm[h_idx:h_idx+kernel_width, w_idx:w_idx+kernel_width] = 1  # sanity check
+                            #     #     break
+                            #     # break
+                            #
+                            # saliency_map2 = sm2 / sm2.max()
+                            #
+                            # saliency_map = saliency_map1 + saliency_map2
+                            # saliency_map /= saliency_map.max()
+
+
+
+
+
+                            # # Ablation CAM
+                            # max_weight = 0
+                            # weights = [[] for _ in range(len(backbone_out))]
+                            # sm = np.zeros((ori_w, ori_h))
+                            # for fpn_idx in used_fpn_levels:
+                            # # for fpn_idx in range(len(backbone_out)):
+                            #     print('fpn_idx', fpn_idx)
+                            #     sm_fpn = np.zeros((backbone_out[fpn_idx].shape[2], backbone_out[fpn_idx].shape[3]))
+                            #     for ch_idx in range(256):
+                            #         backbone_out_clone = [torch.clone(t) for t in backbone_out]
+                            #         backbone_out_clone[fpn_idx][:, ch_idx, :, :] = -1000
+                            #
+                            #         backbone_out_clone_np = [(item[0].detach().cpu().numpy()) for
+                            #                                  item in
+                            #                                  backbone_out_clone]
+                            #
+                            #         proposals_perturbed = model.module.rpn_head.simple_test_rpn(backbone_out_clone,
+                            #                                                                     img_metas)
+                            #         out_perturbed = model.module.roi_head.simple_test(backbone_out_clone,
+                            #                                                           proposals_perturbed,
+                            #                                                           img_metas, rescale=True)
+                            #         pred = out_perturbed[0][0][target_class_id]
+                            #         score = target_score - max([iou(target_box, box) + score for *box, score in pred],
+                            #                                    default=0)
+                            #         weights[fpn_idx].append(score)
+                            #
+                            #         # if score > max_weight:
+                            #         #     max_weight = max(score, max_weight)
+                            #         #     sm_max_weight = np.maximum(0, backbone_out[fpn_idx][0, ch_idx, :, :].cpu().numpy())
+                            #
+                            #
+                            #         sm_fpn += np.maximum(0, backbone_out[fpn_idx][0, ch_idx, :, :].cpu().numpy() * score)
+                            #         # sm_fpn += np.abs(backbone_out[fpn_idx][0, ch_idx, :, :].cpu().numpy()) * score
+                            #     sm_fpn = mmcv.imresize(sm_fpn, (ori_h, ori_w))
+                            #     sm += sm_fpn
+                            # saliency_map = sm / sm.max()
+                            # # saliency_map = sm_max_weight / sm_max_weight.max()
+
+                        toc = time.time()
+                        time_hist.append(toc - tic)
+                        print('Time to explain took', toc - tic)
+                        print('Mean time to explain took', sum(time_hist) / len(time_hist))
 
                         print('Finish explain')
 
-                        # Visualize
-                        import mmcv
-                        from mmcv.image import tensor2imgs
-
-                        img_tensor = data['img'][0].data[0]
-                        img_metas = data['img_metas'][0].data[0]
-                        imgs = tensor2imgs(img_tensor, **img_metas[0]['img_norm_cfg'])
-                        assert len(imgs) == len(img_metas)
-
-                        fig = plt.figure()
-                        plt.axis('off')
-                        imgs_show = mmcv.imresize(imgs[0], (ori_w, ori_h))
-                        plt.imshow(imgs_show)
-                        saliency_map_show = mmcv.imresize(saliency_map, (ori_w, ori_h))
-                        plt.imshow(saliency_map_show, cmap='jet', alpha=0.5)
-                        plt.gca().add_patch(
-                            Rectangle((target_box[0], target_box[1]), target_box[2] - target_box[0],
-                                      target_box[3] - target_box[1],
-                                      linewidth=2, edgecolor='orange', facecolor='none'))
-                        plt.show()
+                        # # Visualize
+                        # img_tensor = data['img'][0].data[0]
+                        # img_metas = data['img_metas'][0].data[0]
+                        # imgs = tensor2imgs(img_tensor, **img_metas[0]['img_norm_cfg'])
+                        # assert len(imgs) == len(img_metas)
+                        #
+                        # fig = plt.figure()
+                        # plt.axis('off')
+                        # imgs_show = mmcv.imresize(imgs[0], (ori_w, ori_h))
+                        # plt.imshow(imgs_show)
+                        # # saliency_map_show = mmcv.imresize(saliency_map, (ori_w, ori_h))
+                        # # plt.imshow(saliency_map_show, cmap='jet', alpha=0.5)
+                        # plt.gca().add_patch(
+                        #     Rectangle((target_box[0], target_box[1]), target_box[2] - target_box[0],
+                        #               target_box[3] - target_box[1],
+                        #               linewidth=2, edgecolor='orange', facecolor='none'))
+                        # # plt.show()
                         # save_name = str(image_id) + '_' + dataloader.dataset.CLASSES[target_class_id] + '_' + str(
                         #     target_box_id) + '.png'
                         # print('save_name', save_name)
-                        # fig.savefig('/home/negvet/tmp/xai_maskrcnn/original/' + save_name, bbox_inches='tight',
+                        # fig.savefig('/home/etsykuno/tmp/xai_maskrcnn/ori/' + save_name, bbox_inches='tight',
                         #             pad_inches=0)
+
+
+                        if run_deletion_insertion:
+                            print('Run deletion insertion...')
+                            print(dataloader.dataset.CLASSES[target_class_id])
+                            if not use_drise:
+                                print(
+                                    f'Use feature map perturbation (ours). PERTURB_MODE {PERTURB_MODE}, ZERO_OUT_VAL {ZERO_OUT_VAL}, LIMITER {LIMITER}')
+                            else:
+                                print('Use D-RISE. n_masks_rise', n_masks_rise, 'rise_seed', rise_seed)
+                            _, _, img_tensor_h, img_tensor_w = data['img'][0].data[0].size()
+                            saliency_map_ins_del = mmcv.imresize(saliency_map, (img_tensor_w, img_tensor_h))
+                            del_auc, ins_auc = deletion_insertion_single_run(data, saliency_map_ins_del,
+                                                                             target_class_id,
+                                                                             target_box,
+                                                                             inherit_hw_from_input=True)
+                            print(f'Del: {del_auc:.3f}, Ins: {ins_auc:.3f}')
+                            del_auc_hist.append(del_auc)
+                            ins_auc_hist.append(ins_auc)
+
+        print()
+        print('Experiment finished!')
+        print('use_drise', use_drise)
+        print('PERTURB_MODE', PERTURB_MODE)
+        print('ZERO_OUT_VAL', ZERO_OUT_VAL)
+        print('CELL_PADDING', CELL_PADDING)
+        print('NUM_PERT_CELLS', NUM_PERT_CELLS)
+        print('LIMITER', LIMITER)
+        print('NUM_STEPS_INS_DEL', NUM_STEPS_INS_DEL)
+        print('HEAD_INFER_BUDGET', HEAD_INFER_BUDGET)
+        print()
+
+        if run_deletion_insertion:
+            print('Ins Del results:')
+            print('Del mean', np.array(del_auc_hist).mean())
+            print('Ins mean', np.array(ins_auc_hist).mean())
+
+
 
 
 
