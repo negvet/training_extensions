@@ -17,7 +17,7 @@ from openvino.model_api.tilers import DetectionTiler
 from torchvision import tv_tensors
 
 from otx.algo.detection.heads.custom_ssd_head import CustomSSDHead
-from otx.algo.hooks.recording_forward_hook import DetClassProbabilityMapHook
+from otx.algo.hooks.recording_forward_hook import DetClassProbabilityMapHook, feature_vector_fn
 from otx.core.config.data import TileConfig
 from otx.core.data.entity.base import (
     OTXBatchLossEntity,
@@ -118,6 +118,7 @@ class ExplainableOTXDetModel(OTXDetectionModel):
         inputs: T_OTXBatchDataEntity,
     ) -> T_OTXBatchPredEntity | OTXBatchLossEntity:
         """Model forward function."""
+        self.model.feature_vector_fn = feature_vector_fn
         self.model.explain_fn = self.get_explain_fn()
 
         # If customize_inputs is overridden
@@ -150,6 +151,7 @@ class ExplainableOTXDetModel(OTXDetectionModel):
         bbox_head_feat = self.bbox_head.forward(backbone_feat)
 
         # Process the first output form bbox detection head: classification scores
+        feature_vector = self.feature_vector_fn(backbone_feat)
         saliency_map = self.explain_fn(bbox_head_feat[0])
 
         if mode == "predict":
@@ -166,12 +168,10 @@ class ExplainableOTXDetModel(OTXDetectionModel):
         else:
             raise RuntimeError(f'Invalid mode "{mode}".')
 
-        # Return dummy feature vector
-        feature_vector = torch.empty(1, dtype=torch.uint8)
         return {
             "predictions": predictions,
-            "saliency_map": saliency_map,
             "feature_vector": feature_vector,
+            "saliency_map": saliency_map,
         }
 
     def get_explain_fn(self) -> Callable:
