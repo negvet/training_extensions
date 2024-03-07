@@ -353,7 +353,15 @@ class MMDetCompatibleModel(ExplainableOTXDetModel):
             labels.append(output.pred_instances.labels)
 
         if self.explain_mode:
-            if not isinstance(outputs, dict) or "saliency_map" not in outputs:
+            if not isinstance(outputs, dict):
+                msg = f"Model output should be a dict, but got {type(outputs)}."
+                raise ValueError(msg)
+
+            if "feature_vector" not in outputs:
+                msg = "No feature vector in the model output."
+                raise ValueError(msg)
+
+            if "saliency_map" not in outputs:
                 msg = "No saliency maps in the model output."
                 raise ValueError(msg)
 
@@ -489,7 +497,8 @@ class OVDetectionModel(OVModel[DetBatchDataEntity, DetBatchPredEntity, DetBatchP
             # Squeeze dim 4D => 3D, (1, num_classes, H, W) => (num_classes, H, W)
             predicted_s_maps = [out.saliency_map[0] for out in outputs]
 
-            predicted_f_vectors = [out.feature_vector for out in outputs]
+            # Squeeze dim 2D => 1D, (1, internal_dim) => (internal_dim)
+            predicted_f_vectors = [out.feature_vector[0] for out in outputs]
             return DetBatchPredEntityWithXAI(
                 batch_size=len(outputs),
                 images=inputs.images,
