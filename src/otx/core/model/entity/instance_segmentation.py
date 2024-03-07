@@ -368,36 +368,23 @@ class MMDetInstanceSegCompatibleModel(ExplainableOTXInstanceSegModel):
             masks.append(output_masks)
             labels.append(output.pred_instances.labels)
 
-            if self.explain_mode:
-                if not isinstance(outputs, dict):
-                    msg = f"Model output should be a dict, but got {type(outputs)}."
-                    raise ValueError(msg)
+        if self.explain_mode:
+            if not isinstance(outputs, dict):
+                msg = f"Model output should be a dict, but got {type(outputs)}."
+                raise ValueError(msg)
 
-                if "feature_vector" not in outputs:
-                    msg = "No feature vector in the model output."
-                    raise ValueError(msg)
+            if "feature_vector" not in outputs:
+                msg = "No feature vector in the model output."
+                raise ValueError(msg)
 
-                if "saliency_map" not in outputs:
-                    msg = "No saliency maps in the model output."
-                    raise ValueError(msg)
+            if "saliency_map" not in outputs:
+                msg = "No saliency maps in the model output."
+                raise ValueError(msg)
 
-                saliency_maps = outputs["saliency_map"].detach().cpu().numpy()
-                feature_vectors = outputs["feature_vector"].detach().cpu().numpy()
+            saliency_maps = outputs["saliency_map"].detach().cpu().numpy()
+            feature_vectors = outputs["feature_vector"].detach().cpu().numpy()
 
-                return InstanceSegBatchPredEntityWithXAI(
-                    batch_size=len(outputs),
-                    images=inputs.images,
-                    imgs_info=inputs.imgs_info,
-                    scores=scores,
-                    bboxes=bboxes,
-                    masks=masks,
-                    polygons=[],
-                    labels=labels,
-                    saliency_maps=list(saliency_maps),
-                    feature_vectors=list(feature_vectors),
-                )
-
-            return InstanceSegBatchPredEntity(
+            return InstanceSegBatchPredEntityWithXAI(
                 batch_size=len(outputs),
                 images=inputs.images,
                 imgs_info=inputs.imgs_info,
@@ -406,7 +393,20 @@ class MMDetInstanceSegCompatibleModel(ExplainableOTXInstanceSegModel):
                 masks=masks,
                 polygons=[],
                 labels=labels,
+                saliency_maps=list(saliency_maps),
+                feature_vectors=list(feature_vectors),
             )
+
+        return InstanceSegBatchPredEntity(
+            batch_size=len(outputs),
+            images=inputs.images,
+            imgs_info=inputs.imgs_info,
+            scores=scores,
+            bboxes=bboxes,
+            masks=masks,
+            polygons=[],
+            labels=labels,
+        )
 
     @property
     def _exporter(self) -> OTXModelExporter:
