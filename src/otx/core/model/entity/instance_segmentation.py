@@ -385,7 +385,7 @@ class MMDetInstanceSegCompatibleModel(ExplainableOTXInstanceSegModel):
             feature_vectors = outputs["feature_vector"].detach().cpu().numpy()
 
             return InstanceSegBatchPredEntityWithXAI(
-                batch_size=len(outputs),
+                batch_size=len(predictions),
                 images=inputs.images,
                 imgs_info=inputs.imgs_info,
                 scores=scores,
@@ -398,7 +398,7 @@ class MMDetInstanceSegCompatibleModel(ExplainableOTXInstanceSegModel):
             )
 
         return InstanceSegBatchPredEntity(
-            batch_size=len(outputs),
+            batch_size=len(predictions),
             images=inputs.images,
             imgs_info=inputs.imgs_info,
             scores=scores,
