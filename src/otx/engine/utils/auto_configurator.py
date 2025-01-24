@@ -52,6 +52,11 @@ DEFAULT_CONFIG_PER_TASK = {
     OTXTaskType.OBJECT_DETECTION_3D: RECIPE_PATH / "object_detection_3d" / "monodetr3d.yaml",
 }
 
+TEST_PATH = get_otx_root_path().parent.parent / "tests"
+DEFAULT_GETI_CONFIG_PER_TASK = {
+    OTXTaskType.MULTI_CLASS_CLS: TEST_PATH /  "assets" / "geti_config_arrow" / "classification" / "multi_class_cls",
+}
+
 TASK_PER_DATA_FORMAT = {
     "imagenet_with_subset_dirs": [OTXTaskType.MULTI_CLASS_CLS, OTXTaskType.H_LABEL_CLS],
     "datumaro": [OTXTaskType.MULTI_LABEL_CLS],
