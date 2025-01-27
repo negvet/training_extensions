@@ -6,6 +6,7 @@ import zipfile
 import shutil
 from tempfile import TemporaryDirectory
 
+import cv2
 import pytest
 
 from otx.core.data.module import OTXDataModule
@@ -39,13 +40,14 @@ def unzip_exportable_code(
 
 
 class TestEngineAPI:
-    def __init__(self, tmp_path: Path, geti_config_path: str, arrow_file_path: str, mapi_model_class: Model):
+    def __init__(self, tmp_path: Path, geti_config_path: Path, arrow_file_path: Path, image_path: Path, mapi_model_class: Model):
         self.tmp_path = tmp_path
         self.geti_config_path = geti_config_path
         self.arrow_file_path = arrow_file_path
         self.otx_config = self._convert_config()
         self.engine, self.train_kwargs = self._instantiate_engine()
         self.mapi_model_class = mapi_model_class
+        self.image = cv2.imread(str(image_path))
 
     def _convert_config(self):
         otx_config = ConfigConverter.convert(config_path=self.geti_config_path)
@@ -99,6 +101,10 @@ class TestEngineAPI:
                 mapi_model = self.mapi_model_class.create_model(onnx_path)
                 assert mapi_model is not None
 
+                predictions = mapi_model(self.image)
+                assert predictions is not None
+                assert len(predictions.top_labels) > 0
+
             exported_path.unlink(missing_ok=True)
 
     def test_export_openvino(self):
@@ -113,7 +119,7 @@ class TestEngineAPI:
             export_dir = exported_path.parent
             assert export_dir.exists()
         
-            # Test how model is loaded by Model API
+            # Test Model API model
             if self.mapi_model_class is not None:
                 ov_export_dir = self.tmp_path / "ov_export"
                 ov_export_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +131,10 @@ class TestEngineAPI:
                 xml_path = ov_export_dir / "exported_model.xml"
                 mapi_model = self.mapi_model_class.create_model(xml_path)
                 assert mapi_model is not None
+
+                predictions = mapi_model(self.image)
+                assert predictions is not None
+                assert len(predictions.top_labels) > 0
 
             exported_path.unlink(missing_ok=True)
 
@@ -149,7 +159,7 @@ class TestEngineAPI:
         )
         assert optimized_path.exists()
 
-        # Test how optimized model is loaded by Model API
+        # Test Model API model
         if self.mapi_model_class is not None:
             ov_optimized_dir = self.tmp_path / "ov_optimize"
             ov_optimized_dir.mkdir(parents=True, exist_ok=True)
@@ -162,6 +172,10 @@ class TestEngineAPI:
             mapi_model = self.mapi_model_class.create_model(xml_path)
             assert mapi_model is not None
 
+            predictions = mapi_model(self.image)
+            assert predictions is not None
+            assert len(predictions.top_labels) > 0
+
 
 @pytest.mark.parametrize("task", pytest.TASK_LIST)
 def test_engine_api(task: OTXTaskType, tmp_path: Path):
@@ -171,10 +185,11 @@ def test_engine_api(task: OTXTaskType, tmp_path: Path):
     config_arrow_path = DEFAULT_GETI_CONFIG_PER_TASK[task]
     geti_config_path = config_arrow_path / "config.json"
     arrow_file_path = config_arrow_path / "datum-0-of-1.arrow"
+    image_path = config_arrow_path / "image.jpg"
 
     mapi_model_class = MAPI_MODELS.get(task, None)
 
-    tester = TestEngineAPI(tmp_path, geti_config_path, arrow_file_path, mapi_model_class)
+    tester = TestEngineAPI(tmp_path, geti_config_path, arrow_file_path, image_path, mapi_model_class)
     tester.test_model_and_data_module()
     tester.test_training()
     tester.test_predictions()
