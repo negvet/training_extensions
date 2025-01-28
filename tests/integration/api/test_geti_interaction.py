@@ -1,23 +1,27 @@
 # Copyright (C) 2025 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-from pathlib import Path
-import zipfile
+from __future__ import annotations
+
 import shutil
+import zipfile
+from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import pytest
-
 from otx.core.data.module import OTXDataModule
 from otx.core.model.base import OTXModel
 from otx.core.types.export import OTXExportFormatType
 from otx.core.types.precision import OTXPrecisionType
-from otx.core.types.task import OTXTaskType
 from otx.engine.utils.auto_configurator import DEFAULT_GETI_CONFIG_PER_TASK, MAPI_MODELS
 from otx.tools.converter import ConfigConverter
 
-from model_api.models import Model
+if TYPE_CHECKING:
+    from model_api.models import Model
+    from otx.core.types.task import OTXTaskType
+    from otx.engine.engine import Engine
 
 
 def unzip_exportable_code(
@@ -40,7 +44,14 @@ def unzip_exportable_code(
 
 
 class TestEngineAPI:
-    def __init__(self, tmp_path: Path, geti_config_path: Path, arrow_file_path: Path, image_path: Path, mapi_model_class: Model):
+    def __init__(
+        self,
+        tmp_path: Path,
+        geti_config_path: Path,
+        arrow_file_path: Path,
+        image_path: Path,
+        mapi_model_class: Model,
+    ):
         self.tmp_path = tmp_path
         self.geti_config_path = geti_config_path
         self.arrow_file_path = arrow_file_path
@@ -49,7 +60,7 @@ class TestEngineAPI:
         self.mapi_model_class = mapi_model_class
         self.image = cv2.imread(str(image_path))
 
-    def _convert_config(self):
+    def _convert_config(self) -> dict:
         otx_config = ConfigConverter.convert(config_path=self.geti_config_path)
         otx_config["data"]["data_format"] = "arrow"
         otx_config["data"]["train_subset"]["subset_name"] = "TRAINING"
@@ -57,7 +68,7 @@ class TestEngineAPI:
         otx_config["data"]["test_subset"]["subset_name"] = "TESTING"
         return otx_config
 
-    def _instantiate_engine(self):
+    def _instantiate_engine(self) -> tuple[Engine, dict[str, Any]]:
         return ConfigConverter.instantiate(
             config=self.otx_config,
             work_dir=self.tmp_path,
@@ -83,7 +94,7 @@ class TestEngineAPI:
         assert predictions is not None
         assert len(predictions) > 0
 
-    def test_export_onnx(self):
+    def test_export_and_infer_onnx(self):
         """Test exporting the model to ONNX."""
         for precision in [OTXPrecisionType.FP16, OTXPrecisionType.FP32]:
             exported_path = self.engine.export(
@@ -107,7 +118,7 @@ class TestEngineAPI:
 
             exported_path.unlink(missing_ok=True)
 
-    def test_export_openvino(self):
+    def test_export_and_infer_openvino(self):
         """Test exporting the model to OpenVINO."""
         for precision in [OTXPrecisionType.FP16, OTXPrecisionType.FP32]:
             exported_path = self.engine.export(
@@ -118,7 +129,7 @@ class TestEngineAPI:
             )
             export_dir = exported_path.parent
             assert export_dir.exists()
-        
+
             # Test Model API model
             if self.mapi_model_class is not None:
                 ov_export_dir = self.tmp_path / "ov_export"
@@ -142,7 +153,7 @@ class TestEngineAPI:
         """Test optimizing the OpenVINO model with FP32 precision."""
         fp32_export_dir = self.tmp_path / "fp32_export"
         fp32_export_dir.mkdir(parents=True, exist_ok=True)
-        exported_path=self.engine.export(
+        exported_path = self.engine.export(
             export_format=OTXExportFormatType.OPENVINO,
             export_precision=OTXPrecisionType.FP32,
             explain=True,
@@ -193,6 +204,6 @@ def test_engine_api(task: OTXTaskType, tmp_path: Path):
     tester.test_model_and_data_module()
     tester.test_training()
     tester.test_predictions()
-    tester.test_export_onnx()
-    tester.test_export_openvino()
+    tester.test_export_and_infer_onnx()
+    tester.test_export_and_infer_openvino()
     tester.test_optimize_openvino_fp32()

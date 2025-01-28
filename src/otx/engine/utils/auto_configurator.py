@@ -13,6 +13,7 @@ from warnings import warn
 
 import datumaro
 from jsonargparse import ArgumentParser, Namespace
+from model_api.models import ClassificationModel
 
 from otx.core.config.data import SamplerConfig, SubsetConfig, TileConfig, UnlabeledDataConfig, VisualPromptingConfig
 from otx.core.data.module import OTXDataModule
@@ -23,8 +24,6 @@ from otx.core.types.task import OTXTaskType
 from otx.core.utils.imports import get_otx_root_path
 from otx.core.utils.instantiators import partial_instantiate_class
 from otx.utils.utils import can_pass_tile_config, get_model_cls_from_config, should_pass_label_info
-
-from model_api.models import ClassificationModel
 
 if TYPE_CHECKING:
     from lightning.pytorch.cli import LRSchedulerCallable, OptimizerCallable
@@ -56,7 +55,7 @@ DEFAULT_CONFIG_PER_TASK = {
 
 TEST_PATH = get_otx_root_path().parent.parent / "tests"
 DEFAULT_GETI_CONFIG_PER_TASK = {
-    OTXTaskType.MULTI_CLASS_CLS: TEST_PATH /  "assets" / "geti_config_arrow" / "classification" / "multi_class_cls",
+    OTXTaskType.MULTI_CLASS_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "multi_class_cls",
 }
 
 MAPI_MODELS = {
