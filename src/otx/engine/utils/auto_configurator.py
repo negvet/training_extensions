@@ -13,7 +13,6 @@ from warnings import warn
 
 import datumaro
 from jsonargparse import ArgumentParser, Namespace
-from model_api.models import ClassificationModel
 
 from otx.core.config.data import SamplerConfig, SubsetConfig, TileConfig, UnlabeledDataConfig, VisualPromptingConfig
 from otx.core.data.module import OTXDataModule
@@ -51,15 +50,6 @@ DEFAULT_CONFIG_PER_TASK = {
     OTXTaskType.KEYPOINT_DETECTION: RECIPE_PATH / "keypoint_detection" / "rtmpose_tiny.yaml",
     OTXTaskType.DIFFUSION: RECIPE_PATH / "diffusion" / "sd_huggingface.yaml",
     OTXTaskType.OBJECT_DETECTION_3D: RECIPE_PATH / "object_detection_3d" / "monodetr3d.yaml",
-}
-
-TEST_PATH = get_otx_root_path().parent.parent / "tests"
-DEFAULT_GETI_CONFIG_PER_TASK = {
-    OTXTaskType.MULTI_CLASS_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "multi_class_cls",
-}
-
-MAPI_MODELS = {
-    OTXTaskType.MULTI_CLASS_CLS: ClassificationModel,
 }
 
 TASK_PER_DATA_FORMAT = {

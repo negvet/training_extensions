@@ -5,7 +5,7 @@
     "header": "Configuration for an image classification task",
     "description": "Configuration for an image classification task",
     "visible_in_ui": true,
-    "id": "6791103e740b95c0bf4e05b6",
+    "id": "6799dbf1740b95c0bf4e0713",
     "type": "CONFIGURABLE_PARAMETERS",
     "algo_backend": {
       "header": "Algo backend parameters",
@@ -568,25 +568,25 @@
   "export_parameters": [
     {
       "type": "openvino",
-      "output_model_id": "6791118d6b2609a5d34bc3c7",
+      "output_model_id": "679a37a9925e92a629c33938",
       "precision": "FP32",
       "with_xai": true
     },
     {
       "type": "openvino",
-      "output_model_id": "6791118d6b2609a5d34bc3c8",
+      "output_model_id": "679a37a9925e92a629c33939",
       "precision": "FP32",
       "with_xai": false
     },
     {
       "type": "openvino",
-      "output_model_id": "6791118d6b2609a5d34bc3c9",
+      "output_model_id": "679a37a9925e92a629c3393a",
       "precision": "FP16",
       "with_xai": false
     },
     {
       "type": "onnx",
-      "output_model_id": "6791118d6b2609a5d34bc3ca",
+      "output_model_id": "679a37a9925e92a629c3393b",
       "precision": "FP32",
       "with_xai": false
     }

@@ -11,17 +11,31 @@ from typing import TYPE_CHECKING, Any
 
 import cv2
 import pytest
+from model_api.models import ClassificationModel
 from otx.core.data.module import OTXDataModule
 from otx.core.model.base import OTXModel
 from otx.core.types.export import OTXExportFormatType
 from otx.core.types.precision import OTXPrecisionType
-from otx.engine.utils.auto_configurator import DEFAULT_GETI_CONFIG_PER_TASK, MAPI_MODELS
+from otx.core.types.task import OTXTaskType
+from otx.core.utils.imports import get_otx_root_path
 from otx.tools.converter import ConfigConverter
 
 if TYPE_CHECKING:
     from model_api.models import Model
-    from otx.core.types.task import OTXTaskType
     from otx.engine.engine import Engine
+
+TEST_PATH = get_otx_root_path().parent.parent / "tests"
+DEFAULT_GETI_CONFIG_PER_TASK = {
+    OTXTaskType.MULTI_CLASS_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "multi_class_cls",
+    OTXTaskType.MULTI_LABEL_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "multi_label_cls",
+    OTXTaskType.H_LABEL_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "h_label_cls",
+}
+
+MAPI_MODELS = {
+    OTXTaskType.MULTI_CLASS_CLS: ClassificationModel,
+    OTXTaskType.MULTI_LABEL_CLS: ClassificationModel,
+    OTXTaskType.H_LABEL_CLS: ClassificationModel,
+}
 
 
 def unzip_exportable_code(
