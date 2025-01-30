@@ -17,14 +17,13 @@ from otx.core.model.base import OTXModel
 from otx.core.types.export import OTXExportFormatType
 from otx.core.types.precision import OTXPrecisionType
 from otx.core.types.task import OTXTaskType
-from otx.core.utils.imports import get_otx_root_path
 from otx.tools.converter import ConfigConverter
 
 if TYPE_CHECKING:
     from model_api.models import Model
     from otx.engine.engine import Engine
 
-TEST_PATH = get_otx_root_path().parent.parent / "tests"
+TEST_PATH = Path(__file__).parent.parent.parent
 DEFAULT_GETI_CONFIG_PER_TASK = {
     OTXTaskType.MULTI_CLASS_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "multi_class_cls",
     OTXTaskType.MULTI_LABEL_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "multi_label_cls",
@@ -163,7 +162,7 @@ class TestEngineAPI:
 
             exported_path.unlink(missing_ok=True)
 
-    def test_optimize_openvino_fp32(self):
+    def test_optimize_and_infer_openvino_fp32(self):
         """Test optimizing the OpenVINO model with FP32 precision."""
         fp32_export_dir = self.tmp_path / "fp32_export"
         fp32_export_dir.mkdir(parents=True, exist_ok=True)
@@ -220,4 +219,4 @@ def test_engine_api(task: OTXTaskType, tmp_path: Path):
     tester.test_predictions()
     tester.test_export_and_infer_onnx()
     tester.test_export_and_infer_openvino()
-    tester.test_optimize_openvino_fp32()
+    tester.test_optimize_and_infer_openvino_fp32()
