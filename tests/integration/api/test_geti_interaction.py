@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import cv2
 import pytest
-from model_api.models import ClassificationModel
+from model_api.models import Model
 from otx.core.data.module import OTXDataModule
 from otx.core.model.base import OTXModel
 from otx.core.types.export import OTXExportFormatType
@@ -20,7 +20,6 @@ from otx.core.types.task import OTXTaskType
 from otx.tools.converter import ConfigConverter
 
 if TYPE_CHECKING:
-    from model_api.models import Model
     from otx.engine.engine import Engine
 
 TEST_PATH = Path(__file__).parent.parent.parent
@@ -28,12 +27,6 @@ DEFAULT_GETI_CONFIG_PER_TASK = {
     OTXTaskType.MULTI_CLASS_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "multi_class_cls",
     OTXTaskType.MULTI_LABEL_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "multi_label_cls",
     OTXTaskType.H_LABEL_CLS: TEST_PATH / "assets" / "geti_config_arrow" / "classification" / "h_label_cls",
-}
-
-MAPI_MODELS = {
-    OTXTaskType.MULTI_CLASS_CLS: ClassificationModel,
-    OTXTaskType.MULTI_LABEL_CLS: ClassificationModel,
-    OTXTaskType.H_LABEL_CLS: ClassificationModel,
 }
 
 
@@ -63,14 +56,12 @@ class TestEngineAPI:
         geti_config_path: Path,
         arrow_file_path: Path,
         image_path: Path,
-        mapi_model_class: Model,
     ):
         self.tmp_path = tmp_path
         self.geti_config_path = geti_config_path
         self.arrow_file_path = arrow_file_path
         self.otx_config = self._convert_config()
         self.engine, self.train_kwargs = self._instantiate_engine()
-        self.mapi_model_class = mapi_model_class
         self.image = cv2.imread(str(image_path))
 
     def _convert_config(self) -> dict:
@@ -119,15 +110,14 @@ class TestEngineAPI:
             export_dir = exported_path.parent
             assert export_dir.exists()
 
-            # Test how model is loaded by Model API
-            if self.mapi_model_class is not None:
-                onnx_path = export_dir / "exported_model.onnx"
-                mapi_model = self.mapi_model_class.create_model(onnx_path)
-                assert mapi_model is not None
+            # Test Model API
+            onnx_path = export_dir / "exported_model.onnx"
+            mapi_model = Model.create_model(onnx_path)
+            assert mapi_model is not None
 
-                predictions = mapi_model(self.image)
-                assert predictions is not None
-                assert len(predictions.top_labels) > 0
+            predictions = mapi_model(self.image)
+            assert predictions is not None
+            assert len(predictions.top_labels) > 0
 
             exported_path.unlink(missing_ok=True)
 
@@ -143,22 +133,21 @@ class TestEngineAPI:
             export_dir = exported_path.parent
             assert export_dir.exists()
 
-            # Test Model API model
-            if self.mapi_model_class is not None:
-                ov_export_dir = self.tmp_path / "ov_export"
-                ov_export_dir.mkdir(parents=True, exist_ok=True)
-                unzip_exportable_code(
-                    work_dir=self.tmp_path,
-                    exported_path=exported_path,
-                    dst_dir=ov_export_dir,
-                )
-                xml_path = ov_export_dir / "exported_model.xml"
-                mapi_model = self.mapi_model_class.create_model(xml_path)
-                assert mapi_model is not None
+            # Test Model API
+            ov_export_dir = self.tmp_path / "ov_export"
+            ov_export_dir.mkdir(parents=True, exist_ok=True)
+            unzip_exportable_code(
+                work_dir=self.tmp_path,
+                exported_path=exported_path,
+                dst_dir=ov_export_dir,
+            )
+            xml_path = ov_export_dir / "exported_model.xml"
+            mapi_model = Model.create_model(xml_path)
+            assert mapi_model is not None
 
-                predictions = mapi_model(self.image)
-                assert predictions is not None
-                assert len(predictions.top_labels) > 0
+            predictions = mapi_model(self.image)
+            assert predictions is not None
+            assert len(predictions.top_labels) > 0
 
             exported_path.unlink(missing_ok=True)
 
@@ -183,22 +172,21 @@ class TestEngineAPI:
         )
         assert optimized_path.exists()
 
-        # Test Model API model
-        if self.mapi_model_class is not None:
-            ov_optimized_dir = self.tmp_path / "ov_optimize"
-            ov_optimized_dir.mkdir(parents=True, exist_ok=True)
-            unzip_exportable_code(
-                work_dir=self.tmp_path,
-                exported_path=optimized_path,
-                dst_dir=ov_optimized_dir,
-            )
-            xml_path = ov_optimized_dir / "exported_model.xml"
-            mapi_model = self.mapi_model_class.create_model(xml_path)
-            assert mapi_model is not None
+        # Test Model API
+        ov_optimized_dir = self.tmp_path / "ov_optimize"
+        ov_optimized_dir.mkdir(parents=True, exist_ok=True)
+        unzip_exportable_code(
+            work_dir=self.tmp_path,
+            exported_path=optimized_path,
+            dst_dir=ov_optimized_dir,
+        )
+        xml_path = ov_optimized_dir / "exported_model.xml"
+        mapi_model = Model.create_model(xml_path)
+        assert mapi_model is not None
 
-            predictions = mapi_model(self.image)
-            assert predictions is not None
-            assert len(predictions.top_labels) > 0
+        predictions = mapi_model(self.image)
+        assert predictions is not None
+        assert len(predictions.top_labels) > 0
 
 
 @pytest.mark.parametrize("task", pytest.TASK_LIST)
@@ -211,9 +199,7 @@ def test_engine_api(task: OTXTaskType, tmp_path: Path):
     arrow_file_path = config_arrow_path / "datum-0-of-1.arrow"
     image_path = config_arrow_path / "image.jpg"
 
-    mapi_model_class = MAPI_MODELS.get(task, None)
-
-    tester = TestEngineAPI(tmp_path, geti_config_path, arrow_file_path, image_path, mapi_model_class)
+    tester = TestEngineAPI(tmp_path, geti_config_path, arrow_file_path, image_path)
     tester.test_model_and_data_module()
     tester.test_training()
     tester.test_predictions()
